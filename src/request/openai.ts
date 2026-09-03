@@ -89,7 +89,7 @@ export function buildResponsesRequestBody(
 }
 
 function mapOpenAiTools(tools: readonly vscode.LanguageModelChatTool[] | undefined): OpenAiToolDefinition[] {
-  const sorted = [...(tools ?? [])].sort((a, b) => a.name.localeCompare(b.name));
+  const sorted = [...(tools ?? [])].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return sorted.map((tool) => ({
     type: "function",
     function: {
@@ -102,7 +102,7 @@ function mapOpenAiTools(tools: readonly vscode.LanguageModelChatTool[] | undefin
 
 function mapResponsesTools(tools: readonly vscode.LanguageModelChatTool[] | undefined, modelId?: string): Record<string, unknown>[] {
   const needsTruncation = isMuseFamily(modelId ?? "");
-  const sorted = [...(tools ?? [])].sort((a, b) => a.name.localeCompare(b.name));
+  const sorted = [...(tools ?? [])].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return sorted.map((tool) => ({
     type: "function",
     name: needsTruncation ? truncateToolName(tool.name) : tool.name,
