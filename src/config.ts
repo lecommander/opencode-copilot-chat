@@ -183,6 +183,25 @@ export const HISTORY_TRIM_SAFETY_MARGIN_TOKENS = 2048;
  */
 export const HISTORY_TRIM_TARGET_RATIO = 0.7;
 /**
+ * Cache-stable trim headroom: when a trim is unavoidable, the trimmer drops
+ * past the minimal fit until the payload sits at least this far below the
+ * budget (the *low-water* mark). A minimal cut leaves almost no slack, so the
+ * next turn's growth re-trims with a different cut point — and the provider's
+ * prefix cache only reuses the bytes before the first changed message, so each
+ * moved cut re-bills the whole conversation at full input price (observed:
+ * hit rate collapses from ~99% to ~11%, only system + tools cached). Dropping
+ * a fixed headroom keeps the cut point stable for several turns: one miss per
+ * trim epoch instead of one miss on nearly every turn at the context ceiling.
+ * Sized as {@link HISTORY_TRIM_HEADROOM_RATIO} of the budget — floored by
+ * {@link HISTORY_TRIM_HEADROOM_MIN_TOKENS} (never more than 10% of the budget,
+ * so a small budget is not dominated) and capped by
+ * {@link HISTORY_TRIM_HEADROOM_MAX_TOKENS}. Applies to the byte ceiling too,
+ * scaled by {@link HISTORY_BYTES_PER_TOKEN}.
+ */
+export const HISTORY_TRIM_HEADROOM_RATIO = 0.03;
+export const HISTORY_TRIM_HEADROOM_MIN_TOKENS = 8_192;
+export const HISTORY_TRIM_HEADROOM_MAX_TOKENS = 32_768;
+/**
  * Hard ceiling on the serialized request payload (bytes). Even after token
  * trimming, a single oversized turn or an inaccurate token estimate can still
  * produce a payload the gateway rejects — the reporter hit a 503 at ~783 KB —

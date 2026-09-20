@@ -1,5 +1,11 @@
 import type * as vscode from "vscode";
-import { HISTORY_BYTES_PER_TOKEN, MAX_REQUEST_PAYLOAD_BYTES } from "../config";
+import {
+  HISTORY_BYTES_PER_TOKEN,
+  HISTORY_TRIM_HEADROOM_MAX_TOKENS,
+  HISTORY_TRIM_HEADROOM_MIN_TOKENS,
+  HISTORY_TRIM_HEADROOM_RATIO,
+  MAX_REQUEST_PAYLOAD_BYTES,
+} from "../config";
 import type { ApiMessage, OpenAiContentPart } from "../request/types";
 import { estimatePromptTokenCount, estimateTokenCount } from "../tokenEstimate";
 
@@ -41,6 +47,12 @@ export interface HistoryTrimResult {
  *   - Base64 image data is EXCLUDED from the byte ceiling (issue #173): image
  *     weight is already bounded by the image-history trimmer, and counting it
  *     made vision payloads trigger futile text-history drops.
+ *   - Cache-stable cut (low-water hysteresis): when a trim is unavoidable the
+ *     oldest droppable units are dropped past the minimal fit down to the
+ *     low-water mark (`budget − headroom`, see `HISTORY_TRIM_HEADROOM_*`), so
+ *     the new cut point survives the next turns instead of shifting — and
+ *     cold-caching the provider prefix — on nearly every turn at the ceiling.
+ *     Bounded by the droppable units; overshoot is at most one unit.
  *
  * @param messages ApiMessage[] (chronological, oldest first). Mutated in place.
  * @param budgetTokens Maximum input tokens the trimmed history may occupy.
@@ -80,6 +92,18 @@ export function trimOldMessagesToFitContext(
   const unitTokens = units.map((u) => sumUnit(messages, u, (m) => estimateTokenCount(JSON.stringify(m))));
   const unitBytes = units.map((u) => sumUnit(messages, u, messageBytes));
 
+  // Low-water mark for the cache-stable cut (see HISTORY_TRIM_HEADROOM_RATIO).
+  // The floor never dominates a small budget (≤10% of it), and the byte mark
+  // mirrors the token mark via the same ratio so both ceilings leave slack.
+  const headroomFloorTokens = Math.min(HISTORY_TRIM_HEADROOM_MIN_TOKENS, Math.floor(budgetTokens * 0.1));
+  const headroomTokens = Math.max(
+    headroomFloorTokens,
+    Math.min(HISTORY_TRIM_HEADROOM_MAX_TOKENS, Math.floor(budgetTokens * HISTORY_TRIM_HEADROOM_RATIO)),
+  );
+  const lowWaterTokens = Math.max(1, budgetTokens - headroomTokens);
+  const headroomBytes = Math.min(Math.floor(headroomTokens * HISTORY_BYTES_PER_TOKEN), Math.floor(maxBytes * HISTORY_TRIM_HEADROOM_RATIO));
+  const lowWaterBytes = Math.max(1, maxBytes - headroomBytes);
+
   let remainingTokens = fullTokens;
   let remainingBytes = fullBytes;
   // Drop units[1..dropUpToUnit] (inclusive) — the oldest droppable turns.
@@ -106,6 +130,22 @@ export function trimOldMessagesToFitContext(
   }
 
   if (dropUpToUnit >= 1) {
+    // Low-water pass: keep dropping (same unit granularity and safety rules)
+    // while the payload is above the low-water mark, so the cut stays put for
+    // the turns that follow. A minimal fit leaves ~zero slack; the next turn
+    // would move the cut and cold-cache the provider prefix. Bounded by the
+    // droppable units — overshoot is at most one unit.
+    for (let u = dropUpToUnit + 1; u < units.length - 1; u++) {
+      if (remainingTokens <= lowWaterTokens && remainingBytes <= lowWaterBytes) {
+        break;
+      }
+      if (isUnsafeToolGroup(messages, units[u])) {
+        break;
+      }
+      remainingTokens -= unitTokens[u];
+      remainingBytes -= unitBytes[u];
+      dropUpToUnit = u;
+    }
     const dropStart = units[1].start;
     const dropEnd = units[dropUpToUnit].end;
     const removed = dropEnd - dropStart + 1;

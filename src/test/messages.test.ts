@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { historyByteCapForBudget, trimOldMessagesToFitContext } from "../provider/historyTrim.js";
-import { HISTORY_BYTES_PER_TOKEN, MAX_REQUEST_PAYLOAD_BYTES } from "../config.js";
+import { HISTORY_BYTES_PER_TOKEN, HISTORY_TRIM_HEADROOM_MIN_TOKENS, MAX_REQUEST_PAYLOAD_BYTES } from "../config.js";
 import type { ApiMessage } from "../request/types.js";
 
 function textMessage(role: ApiMessage["role"], text: string): ApiMessage {
@@ -211,5 +211,57 @@ describe("trimOldMessagesToFitContext — image data excluded from byte cap (#17
     assert.equal(result.removed, 0);
     // The tiny data URL was replaced by the placeholder in the measurement.
     assert.ok(result.finalBytes < JSON.stringify({ messages }).length);
+  });
+});
+
+describe("trimOldMessagesToFitContext — cache-stable headroom", () => {
+  /**
+   * Budget used across these tests: 100K tokens. The headroom resolves to
+   * HISTORY_TRIM_HEADROOM_MIN_TOKENS (8,192): 3% of the budget (3,000) is
+   * below the floor, and the floor stays under 10% of the budget — so the
+   * low-water mark is 100,000 − 8,192 = 91,808 tokens.
+   */
+  const BUDGET = 100_000;
+  const LOW_WATER = BUDGET - HISTORY_TRIM_HEADROOM_MIN_TOKENS;
+
+  function padded(role: ApiMessage["role"], text: string, padChars: number): ApiMessage {
+    return { role, content: `${text} ${"p".repeat(padChars)}` };
+  }
+
+  /** ~133K-token history (units of ~1.1K tokens) so a trim must drop many units. */
+  function overBudgetHistory(): ApiMessage[] {
+    const messages: ApiMessage[] = [padded("user", "ANCHOR", 200)];
+    for (let i = 0; i < 120; i++) {
+      messages.push(padded("user", `turn ${i}`, 4_000));
+    }
+    messages.push(padded("user", "CURRENT", 200));
+    return messages;
+  }
+
+  it("drops below the low-water mark so the next turn does not re-trim", () => {
+    const messages = overBudgetHistory();
+    const result = trimOldMessagesToFitContext(messages, BUDGET, NO_BYTE_CAP);
+    assert.ok(result.removed > 0, "expected a trim");
+    assert.ok(
+      result.finalTokens <= LOW_WATER,
+      `expected finalTokens <= ${String(LOW_WATER)} (budget - headroom), got ${String(result.finalTokens)}`,
+    );
+    assert.ok((messages[0].content as string).startsWith("ANCHOR"));
+    assert.ok((messages[messages.length - 1].content as string).startsWith("CURRENT"));
+  });
+
+  it("keeps the cut stable across following turns (no re-trim → warm prefix cache)", () => {
+    const messages = overBudgetHistory();
+    const first = trimOldMessagesToFitContext(messages, BUDGET, NO_BYTE_CAP);
+    assert.ok(first.removed > 0, "expected the initial trim");
+    const cut = messages[1].content;
+    // Five small follow-up turns, together well below the 8K-token headroom.
+    for (let turn = 0; turn < 5; turn++) {
+      messages.push(padded("assistant", `reply ${String(turn)}`, 100));
+      messages.push(padded("user", `follow-up ${String(turn)}`, 100));
+      const result = trimOldMessagesToFitContext(messages, BUDGET, NO_BYTE_CAP);
+      assert.equal(result.removed, 0, `turn ${String(turn)} must not move the cut point`);
+      assert.equal(messages[1].content, cut, "cut point must stay put");
+    }
   });
 });
