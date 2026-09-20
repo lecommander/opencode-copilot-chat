@@ -66,28 +66,36 @@ holds the cut for roughly 3–10 turns.
 
 ## Files Changed
 
-| File                          | Change                                                         |
-| ----------------------------- | -------------------------------------------------------------- |
-| `src/config.ts`               | `HISTORY_TRIM_HEADROOM_RATIO` / `_MIN_TOKENS` / `_MAX_TOKENS`  |
-| `src/provider/historyTrim.ts` | Low-water pass after the minimal-fit drop; documented contract |
-| `src/test/messages.test.ts`   | Low-water landing test + no-re-trim stability test             |
+| File                          | Change                                                                               |
+| ----------------------------- | ------------------------------------------------------------------------------------ |
+| `src/config.ts`               | `HISTORY_TRIM_HEADROOM_RATIO` / `_MIN_TOKENS` / `_MAX_TOKENS`                        |
+| `src/provider/historyTrim.ts` | Low-water pass after the minimal-fit drop; documented contract                       |
+| `src/test/messages.test.ts`   | Low-water landing test + no-re-trim stability test + production-shape re-supply test |
 
 ## Verification
 
 - `npm run lint` clean (editorconfig, ESLint, markdown, prettier, shell,
   TypeScript, tests).
-- 466/466 unit tests pass, including the two new cases:
+- 467/467 unit tests pass, including the three new cases:
   - a trim lands at or below the low-water mark (`finalTokens ≤ budget − 8,192`
     at a 100K budget) while anchor + current prompt are preserved;
   - five follow-up turns after the trim do not move the cut (`removed == 0`)
-    — with zero headroom (control), the same turns re-trim and move it.
+    — with zero headroom (control), the same turns re-trim and move it;
+  - the production shape (full history re-supplied each turn): the drop count
+    stays constant across turns and each sent payload is a nested prefix of the
+    previous one. Against the compiled pre-fix artifact the same scenario fails
+    (drop count 12 → 13, cut moved).
 - Runtime smoke test against the compiled `out/provider/historyTrim.js` of a
   patched local 0.7.5 build: trim 38 units, land at 91,179 tokens against a
   91,808 low-water mark, cut stable across five turns.
-- Real-world expectation (manual follow-up): after this ships, sessions at
-  the ceiling should show ~99% hits for several turns after each trim and a
-  single ~11% miss per trim epoch, instead of the alternating
-  99.8%/11.4% pattern.
+- Live confirmation (2026-09-20, patched build serving real chats): a session
+  grew to 625,118 tokens against the 613,952 budget and produced 15 trims —
+  every landing 584,252-595,440 (all ≤ the 595,534 low-water mark). Thirteen
+  consecutive trims held the identical cut at 99.9-100% cache hits; the cut
+  shifted only twice after the initial trim, each shift costing exactly one
+  12.3% request, recovered on the next. High-context requests (> 580K tokens):
+  55 requests at 95.2% average with 3 sub-50 misses, versus 243 requests at
+  63.4% with 100 sub-50 misses (41%) pre-fix.
 
 ## Lessons Learned
 

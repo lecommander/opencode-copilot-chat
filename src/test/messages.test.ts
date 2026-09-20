@@ -264,4 +264,37 @@ describe("trimOldMessagesToFitContext — cache-stable headroom", () => {
       assert.equal(messages[1].content, cut, "cut point must stay put");
     }
   });
+
+  it("holds the cut when the full history is re-supplied each turn (production shape)", () => {
+    // Mirrors the live production trace (2026-09-20): VS Code re-supplies the
+    // *full* history every turn, so the trimmer keeps running — but with the
+    // headroom the drop count, and therefore the cut, stays constant. The sent
+    // payload remains a nested prefix of the previous one, which is what keeps
+    // the provider prefix cache warm through those re-trims. Uneven unit sizes
+    // mirror production tool results (every fifth turn is ~6x larger).
+    const full: ApiMessage[] = [padded("user", "ANCHOR", 300)];
+    for (let i = 0; i < 100; i++) {
+      full.push(padded("user", `turn ${String(i)}`, i % 5 === 4 ? 12_000 : 2_000));
+    }
+    full.push(padded("user", "CURRENT", 2_000));
+
+    // Turn 1: the re-supplied full history is over budget and gets trimmed.
+    const sent1 = [...full];
+    const r1 = trimOldMessagesToFitContext(sent1, BUDGET, NO_BYTE_CAP);
+    assert.ok(r1.removed > 0, "the full history must be over budget");
+    assert.ok(r1.finalTokens <= LOW_WATER, "landing must sit below the low-water mark");
+
+    // Turns 2-3: a fresh copy of the full history plus one follow-up exchange
+    // (~680 tokens) each — all within the remaining headroom.
+    let prior = sent1;
+    for (let turn = 0; turn < 2; turn++) {
+      full.push(padded("assistant", `reply ${String(turn)}`, 1_200));
+      full.push(padded("user", `follow-up ${String(turn)}`, 1_200));
+      const sent = [...full];
+      const result = trimOldMessagesToFitContext(sent, BUDGET, NO_BYTE_CAP);
+      assert.equal(result.removed, r1.removed, `turn ${String(turn)} must not move the cut`);
+      assert.deepEqual(sent.slice(0, prior.length), prior, `turn ${String(turn)} payload must stay a nested prefix`);
+      prior = sent;
+    }
+  });
 });
