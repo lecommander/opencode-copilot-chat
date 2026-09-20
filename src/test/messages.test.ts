@@ -297,4 +297,31 @@ describe("trimOldMessagesToFitContext — cache-stable headroom", () => {
       prior = sent;
     }
   });
+
+  it("holds the cut across a normal follow-up turn via the cut-step grid", () => {
+    // The low-water crossing alone lands within one *unit* of the mark, so in
+    // sessions whose units are small relative to per-turn growth the cut still
+    // moved on nearly every turn (live trace 2026-09-20 evening: a 12.4% miss
+    // every 1-3 requests). The cut-step pass adds up to one
+    // HISTORY_TRIM_CUT_STEP_TOKENS of slack (10K at this 100K budget), which
+    // absorbs a ~1.1K-token follow-up turn — this exact scenario moves the cut
+    // without the step pass (verified against the pre-step build).
+    const full: ApiMessage[] = [padded("user", "ANCHOR", 200)];
+    for (let i = 0; i < 150; i++) {
+      full.push(padded("user", `turn ${String(i)}`, 4_000));
+    }
+    full.push(padded("user", "CURRENT", 200));
+
+    const sent1 = [...full];
+    const r1 = trimOldMessagesToFitContext(sent1, BUDGET, NO_BYTE_CAP);
+    assert.ok(r1.removed > 0, "the full history must be over budget");
+
+    // One follow-up turn (~1.1K tokens) — far below one cut step (10K here).
+    full.push(padded("assistant", "reply", 2_000));
+    full.push(padded("user", "follow-up", 2_000));
+    const sent2 = [...full];
+    const r2 = trimOldMessagesToFitContext(sent2, BUDGET, NO_BYTE_CAP);
+    assert.equal(r2.removed, r1.removed, "the cut must not move on a normal follow-up turn");
+    assert.deepEqual(sent2.slice(0, sent1.length), sent1, "payload must stay a nested prefix");
+  });
 });

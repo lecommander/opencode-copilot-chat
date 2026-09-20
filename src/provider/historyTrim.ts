@@ -1,6 +1,7 @@
 import type * as vscode from "vscode";
 import {
   HISTORY_BYTES_PER_TOKEN,
+  HISTORY_TRIM_CUT_STEP_TOKENS,
   HISTORY_TRIM_HEADROOM_MAX_TOKENS,
   HISTORY_TRIM_HEADROOM_MIN_TOKENS,
   HISTORY_TRIM_HEADROOM_RATIO,
@@ -47,12 +48,17 @@ export interface HistoryTrimResult {
  *   - Base64 image data is EXCLUDED from the byte ceiling (issue #173): image
  *     weight is already bounded by the image-history trimmer, and counting it
  *     made vision payloads trigger futile text-history drops.
- *   - Cache-stable cut (low-water hysteresis): when a trim is unavoidable the
- *     oldest droppable units are dropped past the minimal fit down to the
- *     low-water mark (`budget − headroom`, see `HISTORY_TRIM_HEADROOM_*`), so
- *     the new cut point survives the next turns instead of shifting — and
- *     cold-caching the provider prefix — on nearly every turn at the ceiling.
- *     Bounded by the droppable units; overshoot is at most one unit.
+ *   - Cache-stable cut (low-water hysteresis + cut steps): when a trim is
+ *     unavoidable the oldest droppable units are dropped past the minimal fit
+ *     down to the low-water mark (`budget − headroom`, see
+ *     `HISTORY_TRIM_HEADROOM_*`), then on to the next step boundary of dropped
+ *     payload (`HISTORY_TRIM_CUT_STEP_TOKENS`). The step is what keeps the cut
+ *     still: the crossing alone lands within one unit of the mark, so the
+ *     slack for the following turns would be bounded by a single unit's size —
+ *     live sessions with ~2.7K-token units advanced the cut every 1-3 requests
+ *     (~12.4% cache hits), while a step alignment holds it for roughly
+ *     `step / per-turn growth` turns. Bounded by the droppable units; overshoot
+ *     is at most one unit past the step target.
  *
  * @param messages ApiMessage[] (chronological, oldest first). Mutated in place.
  * @param budgetTokens Maximum input tokens the trimmed history may occupy.
@@ -137,6 +143,26 @@ export function trimOldMessagesToFitContext(
     // droppable units — overshoot is at most one unit.
     for (let u = dropUpToUnit + 1; u < units.length - 1; u++) {
       if (remainingTokens <= lowWaterTokens && remainingBytes <= lowWaterBytes) {
+        break;
+      }
+      if (isUnsafeToolGroup(messages, units[u])) {
+        break;
+      }
+      remainingTokens -= unitTokens[u];
+      remainingBytes -= unitBytes[u];
+      dropUpToUnit = u;
+    }
+    // Cut-step pass (see HISTORY_TRIM_CUT_STEP_TOKENS): the low-water crossing
+    // above still hugs the mark within one unit, so once per-turn growth nears
+    // one unit's size the cut would advance on nearly every turn. Advancing it
+    // to the next step boundary of *dropped* payload leaves up to one step of
+    // slack, so the following turns' growth fits without moving the cut.
+    const cutStepTokens = Math.max(1, Math.min(HISTORY_TRIM_CUT_STEP_TOKENS, Math.floor(budgetTokens * 0.1)));
+    const cutStepBytes = Math.max(1, Math.min(Math.floor(cutStepTokens * HISTORY_BYTES_PER_TOKEN), Math.floor(maxBytes * 0.1)));
+    const stepTargetTokens = Math.ceil((fullTokens - remainingTokens) / cutStepTokens) * cutStepTokens;
+    const stepTargetBytes = Math.ceil((fullBytes - remainingBytes) / cutStepBytes) * cutStepBytes;
+    for (let u = dropUpToUnit + 1; u < units.length - 1; u++) {
+      if (fullTokens - remainingTokens >= stepTargetTokens && fullBytes - remainingBytes >= stepTargetBytes) {
         break;
       }
       if (isUnsafeToolGroup(messages, units[u])) {

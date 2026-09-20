@@ -43,40 +43,71 @@ Log correlation from the affected session (trim drop count → next hit rate):
 06:02  trim=319  → 11.3%   (cut moved)
 ```
 
-207 trims fired on that session over ~15 hours. The fix is not about the
+207 trims fired on that session across a ~12-hour span. The fix is not about the
 cache key (that layer was verified working): it is about **keeping the cut
 point still** once a trim is unavoidable.
 
+### Why the low-water mark alone was not enough (evening follow-up)
+
+The first live deployment looked solved in the morning (13 consecutive trims at
+the identical cut, 99.9% hits) but collapsed in the afternoon: from ~14h local
+the hit rate fell to 37-68% with a **12.4% miss every 1-3 requests**. The log
+shows exactly why — every miss sits on a drop-count change:
+
+```text
+17:47 TRIM dropped=214 -> hit 12.4%    (cut moved)
+17:47 TRIM dropped=214 -> hit 100.0%   (same cut)
+17:48 TRIM dropped=216 -> hit 12.4%    (cut moved again)
+18:24 TRIM dropped=222 -> hit 12.4%
+18:25 TRIM dropped=224 -> hit 12.4%
+```
+
+The crossing pass stops at the **first unit** that reaches the low-water mark,
+so the slack left for the following turns is bounded by that unit's size. The
+moment per-turn growth approaches one unit, the cut advances on nearly every
+request. The morning session was lucky — its dropped units happened to include
+large tool results (the first landing left 11,282 tokens of slack, holding the
+cut for 13 trims). The evening session's units averaged ~2.7K tokens against
+~1K of growth per request, so the slack ran out almost immediately.
+
+Shifting the target does **not** help: the landing hugs whichever target within
+one unit, so the move frequency is unchanged — verified in simulation (200-300
+requests, ~2.7K-token units): 75-112 cut moves with the target shifted by up to
+98K tokens below the low-water mark, same as shifting by zero.
+
 ## Fix
 
-When the trimmer drops anything, it now keeps dropping (same unit
-granularity, same tool-group safety rules) until the payload is at or below
-a **low-water mark**: `budget − headroom`, with the headroom from new config
-constants `HISTORY_TRIM_HEADROOM_RATIO` (3%), floored by
-`HISTORY_TRIM_HEADROOM_MIN_TOKENS` (8,192 — capped at 10% of the budget so a
-small budget is never dominated) and capped by
-`HISTORY_TRIM_HEADROOM_MAX_TOKENS` (32,768). The byte ceiling mirrors the
-token mark via the same ratio (`HISTORY_BYTES_PER_TOKEN`).
+Two changes now keep the cut still (same unit granularity, same tool-group
+safety rules, both applied to the byte ceiling via `HISTORY_BYTES_PER_TOKEN`):
 
-Trade-off: a trim now sheds a bounded amount of extra old context
-(≤ headroom, overshoot ≤ one unit) in exchange for a cut that survives the
-following turns — one cold prefix per trim epoch instead of a cold prefix on
-nearly every turn. With ~2–3K tokens of growth per turn, an 8K–32K headroom
-holds the cut for roughly 3–10 turns.
+1. **Low-water mark.** When the trimmer drops anything, it keeps dropping until
+   the payload is at or below `budget − headroom`, with the headroom from
+   `HISTORY_TRIM_HEADROOM_RATIO` (3%), floored by
+   `HISTORY_TRIM_HEADROOM_MIN_TOKENS` (8,192 — capped at 10% of the budget) and
+   capped by `HISTORY_TRIM_HEADROOM_MAX_TOKENS` (32,768).
+2. **Cut-step alignment.** It then continues to the next
+   `HISTORY_TRIM_CUT_STEP_TOKENS` (32,768; capped at 10% of the budget) boundary
+   of _dropped_ payload. That boundary is a fixed grid: the cut stays until
+   accumulated growth pushes the crossing past it — up to a full step of slack per
+   advance, instead of one unit.
+
+Trade-off: a trim sheds a bounded amount of extra (oldest-first) context — up
+to the headroom plus one cut step — in exchange for a cut that survives many
+turns: one cold prefix per epoch instead of one on nearly every turn.
 
 ## Files Changed
 
-| File                          | Change                                                                               |
-| ----------------------------- | ------------------------------------------------------------------------------------ |
-| `src/config.ts`               | `HISTORY_TRIM_HEADROOM_RATIO` / `_MIN_TOKENS` / `_MAX_TOKENS`                        |
-| `src/provider/historyTrim.ts` | Low-water pass after the minimal-fit drop; documented contract                       |
-| `src/test/messages.test.ts`   | Low-water landing test + no-re-trim stability test + production-shape re-supply test |
+| File                          | Change                                                                                               |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `src/config.ts`               | `HISTORY_TRIM_HEADROOM_RATIO` / `_MIN_TOKENS` / `_MAX_TOKENS`, `HISTORY_TRIM_CUT_STEP_TOKENS`        |
+| `src/provider/historyTrim.ts` | Low-water pass + cut-step pass after the minimal-fit drop; documented contract                       |
+| `src/test/messages.test.ts`   | Low-water landing test + no-re-trim stability test + production-shape re-supply test + cut-step test |
 
 ## Verification
 
 - `npm run lint` clean (editorconfig, ESLint, markdown, prettier, shell,
   TypeScript, tests).
-- 467/467 unit tests pass, including the three new cases:
+- 468/468 unit tests pass, including the four new cases:
   - a trim lands at or below the low-water mark (`finalTokens ≤ budget − 8,192`
     at a 100K budget) while anchor + current prompt are preserved;
   - five follow-up turns after the trim do not move the cut (`removed == 0`)
@@ -84,7 +115,15 @@ holds the cut for roughly 3–10 turns.
   - the production shape (full history re-supplied each turn): the drop count
     stays constant across turns and each sent payload is a nested prefix of the
     previous one. Against the compiled pre-fix artifact the same scenario fails
-    (drop count 12 → 13, cut moved).
+    (drop count 12 → 13, cut moved);
+  - the cut-step grid: a ~1.1K-token follow-up turn does not move the cut —
+    the same scenario moves it without the step pass (verified against the
+    pre-step build: 68 → 70 vs 79 → 79 dropped units).
+- Simulation (300 requests, production budget 613,952, byte cap 2,762,784):
+  cut moves fall from **84/300 (28%) to 12/300 (4%)** in the evening regime
+  (~2.7K-token units, ~1K growth per request) and from **244/300 (81%) to
+  14/300 (5%)** in the smaller-unit regime (~800-token units) — the step pass
+  makes the stability independent of the unit size.
 - Runtime smoke test against the compiled `out/provider/historyTrim.js` of a
   patched local 0.7.5 build: trim 38 units, land at 91,179 tokens against a
   91,808 low-water mark, cut stable across five turns.
@@ -96,11 +135,17 @@ holds the cut for roughly 3–10 turns.
   12.3% request, recovered on the next. High-context requests (> 580K tokens):
   55 requests at 95.2% average with 3 sub-50 misses, versus 243 requests at
   63.4% with 100 sub-50 misses (41%) pre-fix.
+- Live counter-example that motivated the cut-step pass (same day, evening):
+  the hour-by-hour hit rate fell from 99.9% (10h-13h local) to **37-68% from
+  14h on**, with a 12.4% miss on every drop-count change (drop counts walked
+  214 → 242 over ~50 minutes). See the evening analysis above.
 
 ## Lessons Learned
 
 A trim that "just fits" is not free: at the context ceiling it turns every
 following turn into a cache miss, because the provider prefix cache breaks at
 the first changed message. Trimming is only cheap when its cut point is
-**stable** — so the trimmer must optimize for stillness, not for keeping the
-maximum number of tokens.
+**stable** — and stability is bounded by the _granularity_ the cut advances in.
+A low landing target alone does not help: the trimmer stops at the first unit
+that crosses it, so the slack is always one unit wide at best. Making the cut
+advance on a fixed grid is what buys multi-turn stillness.
